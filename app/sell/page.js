@@ -1,215 +1,283 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { supabase } from "../../lib/supabaseClient";
+import { supabase, isSupabaseConfigured } from "../../lib/supabaseClient";
+import { PRODUCTS as FALLBACK_PRODUCTS } from "../../lib/products";
+import {
+  notifyTelegram,
+  buildOrderAlertMessage,
+  buildLowStockMessage,
+  LOW_STOCK_THRESHOLD,
+} from "../../lib/telegram";
+
+function formatBaht(n) {
+  return "฿" + Number(n || 0).toLocaleString("en-US");
+}
 
 export default function SellPage() {
-  const [products, setProducts] = useState([]);
-  const [selectedSku, setSelectedSku] = useState("");
-  const [quantity, setQuantity] = useState(1);
-  const [message, setMessage] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [products, setProducts] = useState(FALLBACK_PRODUCTS);
+  const [loadingProducts, setLoadingProducts] = useState(true);
+  const [cart, setCart] = useState([]);
+  const [status, setStatus] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
 
-  const loadProducts = async () => {
-    const { data, error } = await supabase
-      .from("products")
-      .select("sku,name,price,stock,unit")
-      .order("sku");
-
-    if (error) {
-      setMessage("โหลดสินค้าไม่สำเร็จ: " + error.message);
+  async function loadProducts() {
+    if (!supabase) {
+      setProducts(FALLBACK_PRODUCTS);
+      setLoadingProducts(false);
       return;
     }
-
-    setProducts(data || []);
-  };
+    setLoadingProducts(true);
+    const { data, error } = await supabase.from("products").select("*").order("id");
+    if (error || !data || !data.length) {
+      setProducts(FALLBACK_PRODUCTS);
+    } else {
+      setProducts(data);
+    }
+    setLoadingProducts(false);
+  }
 
   useEffect(() => {
     loadProducts();
   }, []);
 
-  const selectedProduct = products.find(
-    (product) => product.sku === selectedSku
-  );
+  function findProduct(id) {
+    return products.find((p) => p.id === id);
+  }
 
-  const sellProduct = async () => {
-    setMessage("");
+  function addToCart(product) {
+    setStatus(null);
+    if (product.stock <= 0) return;
+    setCart((prev) => {
+      const existing = prev.find((l) => l.id === product.id);
+      const currentQty = existing ? existing.qty : 0;
+      if (currentQty >= product.stock) return prev;
+      if (existing) {
+        return prev.map((l) =>
+          l.id === product.id ? { ...l, qty: l.qty + 1 } : l
+        );
+      }
+      return [...prev, { ...product, qty: 1 }];
+    });
+  }
 
-    if (!selectedProduct) {
-      setMessage("กรุณาเลือกสินค้า");
+  function changeQty(id, delta) {
+    const product = findProduct(id);
+    setCart((prev) =>
+      prev
+        .map((l) => {
+          if (l.id !== id) return l;
+          const nextQty = l.qty + delta;
+          const clamped = product ? Math.min(nextQty, product.stock) : nextQty;
+          return { ...l, qty: clamped };
+        })
+        .filter((l) => l.qty > 0)
+    );
+  }
+
+  function removeLine(id) {
+    setCart((prev) => prev.filter((l) => l.id !== id));
+  }
+
+  const total = cart.reduce((sum, l) => sum + l.price * l.qty, 0);
+  const totalQty = cart.reduce((sum, l) => sum + l.qty, 0);
+
+  async function handleCheckout() {
+    if (!cart.length || submitting) return;
+    setSubmitting(true);
+    setStatus({ mode: "pending", message: "กำลังตัดสต๊อกและบันทึกการขาย…" });
+
+    if (!supabase) {
+      setSubmitting(false);
+      setStatus({
+        mode: "error",
+        message: "ยังไม่ได้เชื่อมต่อ Supabase จึงบันทึกการขายไม่ได้ กรุณาตั้งค่า Environment Variables ก่อน",
+      });
       return;
     }
 
-    const qty = Number(quantity);
+    const fulfilled = [];
+    const unavailable = [];
 
-    if (!Number.isInteger(qty) || qty <= 0) {
-      setMessage("กรุณาใส่จำนวนสินค้าให้ถูกต้อง");
+    for (const line of cart) {
+      try {
+        const { data: fresh, error: readErr } = await supabase
+          .from("products")
+          .select("id, stock")
+          .eq("id", line.id)
+          .single();
+
+        if (readErr || !fresh) {
+          unavailable.push({ name: line.name, reason: "not-found" });
+          continue;
+        }
+
+        const qtyToDeduct = Math.min(line.qty, fresh.stock);
+        if (qtyToDeduct <= 0) {
+          unavailable.push({ name: line.name, reason: "sold-out" });
+          continue;
+        }
+
+        const stockAfter = fresh.stock - qtyToDeduct;
+        const { error: updateErr } = await supabase
+          .from("products")
+          .update({ stock: stockAfter })
+          .eq("id", line.id)
+          .gte("stock", qtyToDeduct);
+
+        if (updateErr) {
+          unavailable.push({ name: line.name, reason: "update-failed" });
+          continue;
+        }
+
+        fulfilled.push({
+          id: line.id,
+          name: line.name,
+          price: line.price,
+          qty: qtyToDeduct,
+          stockAfter,
+        });
+        if (qtyToDeduct < line.qty) {
+          unavailable.push({ name: line.name, reason: "partial" });
+        }
+      } catch (err) {
+        unavailable.push({ name: line.name, reason: "error" });
+      }
+    }
+
+    if (!fulfilled.length) {
+      setSubmitting(false);
+      setStatus({
+        mode: "error",
+        message: "สินค้าที่เลือกหมดสต๊อกแล้ว กรุณาลองใหม่อีกครั้ง",
+      });
+      loadProducts();
       return;
     }
 
-    if (qty > selectedProduct.stock) {
-      setMessage(
-        `สินค้าไม่พอ เหลือ ${selectedProduct.stock} ${selectedProduct.unit}`
-      );
-      return;
-    }
-
-    setLoading(true);
-
-    const total = Number(selectedProduct.price) * qty;
-
-    const { error } = await supabase.from("sales").insert({
-      product_name: selectedProduct.name,
-      quantity: qty,
-      total_price: total,
+    const fulfilledTotal = fulfilled.reduce((sum, it) => sum + it.price * it.qty, 0);
+    const { error: saleErr } = await supabase.from("sales").insert({
+      created_at: new Date().toISOString(),
+      items: fulfilled.map((it) => ({ id: it.id, name: it.name, qty: it.qty, price: it.price })),
+      total: fulfilledTotal,
     });
 
-    if (error) {
-      setMessage("ขายสินค้าไม่สำเร็จ: " + error.message);
-      setLoading(false);
+    setSubmitting(false);
+
+    if (saleErr) {
+      setStatus({ mode: "error", message: "บันทึกการขายไม่สำเร็จ: " + saleErr.message });
+      loadProducts();
       return;
     }
 
-    const { error: stockError } = await supabase
-      .from("products")
-      .update({
-        stock: selectedProduct.stock - qty,
-      })
-      .eq("sku", selectedProduct.sku);
-
-    if (stockError) {
-      setMessage("บันทึกการขายแล้ว แต่หักสต็อกไม่สำเร็จ");
-      setLoading(false);
-      await loadProducts();
-      return;
+    for (const item of fulfilled) {
+      notifyTelegram(buildOrderAlertMessage(item, item.stockAfter));
+      if (item.stockAfter <= LOW_STOCK_THRESHOLD) {
+        notifyTelegram(buildLowStockMessage(item, item.stockAfter));
+      }
     }
 
-    setMessage(
-      `ขายสำเร็จ! ${selectedProduct.name} × ${qty} = ฿${total.toLocaleString()}`
-    );
-
-    setQuantity(1);
-    setLoading(false);
-
-    await loadProducts();
-  };
+    setStatus({
+      mode: "success",
+      message: unavailable.length
+        ? `บันทึกการขายสำเร็จบางส่วน — บางรายการสต๊อกไม่พอ (${unavailable.map((u) => u.name).join(", ")})`
+        : "บันทึกการขายเรียบร้อยแล้ว!",
+    });
+    setCart([]);
+    loadProducts();
+  }
 
   return (
-    <main
-      style={{
-        maxWidth: "700px",
-        margin: "40px auto",
-        padding: "24px",
-        fontFamily: "Arial, sans-serif",
-      }}
-    >
-      <h1>ขายสินค้า</h1>
+    <div>
+      <div className="page-header">
+        <h1>ขายสินค้า</h1>
+        <p>เลือกสินค้าเพื่อเพิ่มลงตะกร้า แล้วกดชำระเงินเมื่อพร้อม</p>
+      </div>
 
-      <div style={{ marginTop: "30px" }}>
-        <label>เลือกสินค้า</label>
+      {!isSupabaseConfigured && (
+        <div className="notice">
+          ยังไม่ได้ตั้งค่า Supabase — สามารถทดลองใช้ตะกร้าได้ แต่จะไม่สามารถบันทึกการขายหรือตัดสต๊อกได้จนกว่าจะตั้งค่า Environment Variables
+        </div>
+      )}
 
-        <select
-          value={selectedSku}
-          onChange={(e) => setSelectedSku(e.target.value)}
-          style={{
-            width: "100%",
-            padding: "12px",
-            marginTop: "8px",
-            fontSize: "16px",
-          }}
-        >
-          <option value="">-- เลือกสินค้า --</option>
-
-          {products.map((product) => (
-            <option key={product.sku} value={product.sku}>
-              {product.name} — ฿{Number(product.price).toLocaleString()} — เหลือ{" "}
-              {product.stock} {product.unit}
-            </option>
+      <div className="sell-layout">
+        <div className="product-list">
+          {products.map((p) => (
+            <button
+              key={p.id}
+              className="product-tile"
+              onClick={() => addToCart(p)}
+              type="button"
+              disabled={p.stock <= 0}
+            >
+              <div className="product-tile-top">
+                <span className="product-name">{p.name}</span>
+              </div>
+              <span className="product-unit">ต่อ {p.unit}</span>
+              <span className="product-price">{formatBaht(p.price)}</span>
+              <span className="product-unit">
+                {p.stock <= 0
+                  ? "สินค้าหมด"
+                  : p.stock <= LOW_STOCK_THRESHOLD
+                  ? `เหลือ ${p.stock} ชิ้น (ใกล้หมด)`
+                  : `คงเหลือ ${p.stock} ชิ้น`}
+              </span>
+            </button>
           ))}
-        </select>
+        </div>
+
+        <aside className="card cart-panel">
+          <div className="cart-header">
+            <h2>ตะกร้าสินค้า</h2>
+            <span className="stat-sub">{totalQty} ชิ้น</span>
+          </div>
+
+          {cart.length === 0 ? (
+            <div className="cart-empty">ยังไม่มีสินค้าในตะกร้า<br />แตะสินค้าด้านซ้ายเพื่อเพิ่ม</div>
+          ) : (
+            <ul>
+              {cart.map((l) => (
+                <li key={l.id} className="cart-line">
+                  <div className="cart-line-meta">
+                    <div className="cart-line-name">{l.name}</div>
+                    <div className="cart-line-price">{formatBaht(l.price)} / {l.unit}</div>
+                    <button className="remove-btn" onClick={() => removeLine(l.id)} type="button">
+                      ลบ
+                    </button>
+                  </div>
+                  <div className="qty-control">
+                    <button className="qty-btn" onClick={() => changeQty(l.id, -1)} type="button">−</button>
+                    <span className="qty-val">{l.qty}</span>
+                    <button className="qty-btn" onClick={() => changeQty(l.id, 1)} type="button">+</button>
+                  </div>
+                  <div className="line-total">{formatBaht(l.price * l.qty)}</div>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <div className="cart-summary">
+            <div className="summary-row total">
+              <span>ยอดรวม</span>
+              <span>{formatBaht(total)}</span>
+            </div>
+          </div>
+
+          <button
+            className="btn btn-primary btn-full"
+            style={{ marginTop: "14px" }}
+            disabled={!cart.length || submitting || loadingProducts}
+            onClick={handleCheckout}
+            type="button"
+          >
+            {submitting ? "กำลังบันทึก…" : "ชำระเงิน"}
+          </button>
+
+          {status && (
+            <div className={"status-msg " + status.mode}>{status.message}</div>
+          )}
+        </aside>
       </div>
-
-      {selectedProduct && (
-        <div
-          style={{
-            marginTop: "20px",
-            padding: "20px",
-            border: "1px solid #ddd",
-            borderRadius: "12px",
-          }}
-        >
-          <h2>{selectedProduct.name}</h2>
-
-          <p>
-            ราคา: ฿{Number(selectedProduct.price).toLocaleString()}
-          </p>
-
-          <p>
-            คงเหลือ: {selectedProduct.stock} {selectedProduct.unit}
-          </p>
-
-          <p>SKU: {selectedProduct.sku}</p>
-        </div>
-      )}
-
-      <div style={{ marginTop: "20px" }}>
-        <label>จำนวน</label>
-
-        <input
-          type="number"
-          min="1"
-          value={quantity}
-          onChange={(e) => setQuantity(e.target.value)}
-          style={{
-            width: "100%",
-            padding: "12px",
-            marginTop: "8px",
-            fontSize: "16px",
-          }}
-        />
-      </div>
-
-      {selectedProduct && (
-        <div
-          style={{
-            marginTop: "20px",
-            fontSize: "20px",
-            fontWeight: "bold",
-          }}
-        >
-          รวม: ฿
-          {(
-            Number(selectedProduct.price) * Number(quantity || 0)
-          ).toLocaleString()}
-        </div>
-      )}
-
-      <button
-        onClick={sellProduct}
-        disabled={loading}
-        style={{
-          width: "100%",
-          marginTop: "25px",
-          padding: "14px",
-          fontSize: "18px",
-          cursor: loading ? "not-allowed" : "pointer",
-        }}
-      >
-        {loading ? "กำลังบันทึก..." : "ขายสินค้า"}
-      </button>
-
-      {message && (
-        <div
-          style={{
-            marginTop: "20px",
-            padding: "15px",
-            borderRadius: "10px",
-            background: "#f5f5f5",
-          }}
-        >
-          {message}
-        </div>
-      )}
-    </main>
+    </div>
   );
 }
