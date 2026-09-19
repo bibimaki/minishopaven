@@ -1,3 +1,21 @@
+
+const LOW_STOCK_ALERT_THRESHOLD = 5;
+
+// ส่งแจ้งเตือนผ่าน API Route ของเราเอง (ไม่ยิง Telegram ตรงจาก browser)
+// เพื่อไม่ให้ bot token หลุดไปฝั่ง client และเพื่อไม่ให้ error ของ Telegram
+// กระทบขั้นตอนขายสินค้าหลัก — ฟังก์ชันนี้ "กลืน" error ทุกกรณีไว้เอง
+async function notifyTelegram(type, payload) {
+  try {
+    await fetch("/api/notify-telegram", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type, payload }),
+    });
+  } catch (err) {
+    // ตั้งใจไม่ throw ต่อ — การแจ้งเตือนล้มเหลวต้องไม่ทำให้การขายขัดข้อง
+    console.warn("Mini POS: Telegram notification failed (ignored).", err);
+  }
+}
 "use client";
 
 import { useEffect, useState } from "react";
