@@ -1,1 +1,1 @@
-# minishopaven
+# mini-aven
